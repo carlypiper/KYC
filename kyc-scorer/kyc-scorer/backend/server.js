@@ -97,7 +97,7 @@ Respond ONLY with this JSON, no other text:
 
   try {
     const message = await client.messages.create({
-      model,
+      model: MODEL,
       max_tokens: 1500,
       messages: [{ role: "user", content: prompt }],
     });
