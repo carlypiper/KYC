@@ -7,6 +7,7 @@
  * Endpoints:
  *   POST /api/detect-schema  — LLM reads spreadsheet data and maps columns
  *   POST /api/score-customer — LLM scores a single customer's address data
+ *   POST /api/score-customers — Scores multiple customers with controlled concurrency
  */
 
 const express = require("express");
@@ -51,6 +52,61 @@ app.use(express.json({ limit: "10mb" }));
 
 const MODEL   = "claude-sonnet-4-20250514";
 const TODAY   = new Date().toISOString().split("T")[0];
+
+// ── Concurrency limiter ───────────────────────────────────────────────────────
+// Controls how many simultaneous Anthropic API calls are made when scoring
+// multiple customers. Keeps us well within rate limits.
+// Adjust CONCURRENCY_LIMIT up or down based on your API tier.
+
+const CONCURRENCY_LIMIT = parseInt(process.env.CONCURRENCY_LIMIT || "5", 10);
+
+function createLimiter(concurrency) {
+  let active = 0;
+  const queue = [];
+
+  function next() {
+    if (active >= concurrency || queue.length === 0) return;
+    active++;
+    const { fn, resolve, reject } = queue.shift();
+    fn()
+      .then(resolve)
+      .catch(reject)
+      .finally(() => {
+        active--;
+        next();
+      });
+  }
+
+  return function limit(fn) {
+    return new Promise((resolve, reject) => {
+      queue.push({ fn, resolve, reject });
+      next();
+    });
+  };
+}
+
+const limit = createLimiter(CONCURRENCY_LIMIT);
+
+// ── Safe JSON parser ──────────────────────────────────────────────────────────
+// Wraps JSON.parse with a descriptive error so the caller knows exactly
+// what went wrong and can surface it meaningfully in the UI.
+
+function safeParseJSON(text, context) {
+  const cleaned = text.replace(/```json|```/g, "").trim();
+  try {
+    return { data: JSON.parse(cleaned), error: null };
+  } catch (err) {
+    return {
+      data: null,
+      error: {
+        code: "PARSE_ERROR",
+        context,
+        message: `The AI response for ${context} was not valid JSON. This can happen occasionally — please retry.`,
+        raw: cleaned.slice(0, 300), // truncated for logging, not sent to client
+      },
+    };
+  }
+}
 
 // ── Health check ─────────────────────────────────────────────────────────────
 
@@ -102,21 +158,25 @@ Respond ONLY with this JSON, no other text:
       messages: [{ role: "user", content: prompt }],
     });
 
-    const text = message.content
-      .map(b => b.text || "")
-      .join("")
-      .replace(/```json|```/g, "")
-      .trim();
+    const text = message.content.map(b => b.text || "").join("");
+    const { data, error } = safeParseJSON(text, "schema detection");
 
-    const schemaMap = JSON.parse(text);
-    res.json(schemaMap);
+    if (error) {
+      console.error("Schema parse error:", error.raw);
+      return res.status(502).json({
+        error: error.message,
+        code: error.code,
+      });
+    }
+
+    res.json(data);
   } catch (err) {
     console.error("Schema detection error:", err.message);
     res.status(500).json({ error: "Schema detection failed: " + err.message });
   }
 });
 
-// ── Customer Scoring ──────────────────────────────────────────────────────────
+// ── Scoring system prompt ─────────────────────────────────────────────────────
 
 const SCORING_SYSTEM = `You are a KYC compliance analysis engine for financial institutions.
 
@@ -148,6 +208,28 @@ Respond ONLY with a valid JSON object, no other text:
   "missing_data_impact": [<specific actionable recommendations>]
 }`;
 
+// ── Shared scoring function ───────────────────────────────────────────────────
+
+async function scoreCustomer(customerData) {
+  const message = await client.messages.create({
+    model: MODEL,
+    max_tokens: 1000,
+    system: SCORING_SYSTEM,
+    messages: [{
+      role: "user",
+      content: `Analyse this customer and return the JSON confidence score:\n\n${JSON.stringify(customerData, null, 2)}`,
+    }],
+  });
+
+  const text = message.content.map(b => b.text || "").join("");
+  const { data, error } = safeParseJSON(text, `customer ${customerData?.customer_id || "unknown"}`);
+
+  if (error) throw error;
+  return data;
+}
+
+// ── Single customer scoring ───────────────────────────────────────────────────
+
 app.post("/api/score-customer", async (req, res) => {
   const { customerData } = req.body;
 
@@ -156,27 +238,61 @@ app.post("/api/score-customer", async (req, res) => {
   }
 
   try {
-    const message = await client.messages.create({
-      model: MODEL,
-      max_tokens: 1000,
-      system: SCORING_SYSTEM,
-      messages: [{
-        role: "user",
-        content: `Analyse this customer and return the JSON confidence score:\n\n${JSON.stringify(customerData, null, 2)}`,
-      }],
-    });
-
-    const text = message.content
-      .map(b => b.text || "")
-      .join("")
-      .replace(/```json|```/g, "")
-      .trim();
-
-    const score = JSON.parse(text);
+    const score = await scoreCustomer(customerData);
     res.json(score);
   } catch (err) {
+    // Distinguish parse errors from API errors for better UI messaging
+    if (err.code === "PARSE_ERROR") {
+      console.error("Scoring parse error:", err.raw);
+      return res.status(502).json({ error: err.message, code: err.code });
+    }
     console.error("Scoring error:", err.message);
     res.status(500).json({ error: "Scoring failed: " + err.message });
+  }
+});
+
+// ── Bulk customer scoring (concurrency-limited) ───────────────────────────────
+//
+// Accepts an array of customerData objects and scores them in parallel,
+// capped at CONCURRENCY_LIMIT simultaneous API calls.
+//
+// Each result includes the original customer_id so the frontend can
+// match scores back to customers regardless of response order.
+//
+// Failed individual scores are returned with { error } rather than
+// aborting the entire batch, so one bad record doesn't block the rest.
+
+app.post("/api/score-customers", async (req, res) => {
+  const { customers } = req.body;
+
+  if (!Array.isArray(customers) || customers.length === 0) {
+    return res.status(400).json({ error: "customers must be a non-empty array" });
+  }
+
+  try {
+    const results = await Promise.all(
+      customers.map(customerData =>
+        limit(async () => {
+          try {
+            const score = await scoreCustomer(customerData);
+            return { customer_id: customerData?.customer_id, ...score };
+          } catch (err) {
+            // Per-customer failure — log and return gracefully so batch continues
+            console.error(`Failed to score customer ${customerData?.customer_id}:`, err.message || err);
+            return {
+              customer_id: customerData?.customer_id,
+              error: err.message || "Scoring failed for this customer — please retry.",
+              code: err.code || "SCORING_ERROR",
+            };
+          }
+        })
+      )
+    );
+
+    res.json({ results });
+  } catch (err) {
+    console.error("Bulk scoring error:", err.message);
+    res.status(500).json({ error: "Bulk scoring failed: " + err.message });
   }
 });
 
@@ -186,4 +302,5 @@ const PORT = process.env.PORT || 3001;
 app.listen(PORT, () => {
   console.log(`✅ KYC Scorer backend running on port ${PORT}`);
   console.log(`   API key loaded: ${process.env.ANTHROPIC_API_KEY ? "yes" : "NO — set ANTHROPIC_API_KEY"}`);
+  console.log(`   Concurrency limit: ${CONCURRENCY_LIMIT}`);
 });
