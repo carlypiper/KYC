@@ -9,16 +9,13 @@ const SCHEMA_COLUMNS = {
   account:  ["customer_id","account_open_date","last_interaction_date","last_interaction_channel","document_verification_status"],
 };
 
-const TODAY = new Date().toISOString().split("T")[0];
-
 const TRAFFIC = {
   GREEN: { bg: "#00875A", light: "#E3FCEF", label: "COMPLIANT" },
   AMBER: { bg: "#FF8B00", light: "#FFFAE6", label: "REVIEW" },
   RED:   { bg: "#DE350B", light: "#FFEBE6", label: "ACTION" },
 };
 
-// Scoring logic and prompts live on the backend (backend/server.js)
-// This keeps the API key and business logic secure and server-side.
+const API_URL = import.meta.env.VITE_API_URL || "http://localhost:3001";
 
 // ── Utilities ────────────────────────────────────────────────────────────────
 
@@ -32,97 +29,51 @@ function normaliseRows(rows) {
   });
 }
 
-// ── LLM Schema Mapping ───────────────────────────────────────────────────────
+// ── API Calls ─────────────────────────────────────────────────────────────────
 
-/**
- * Ask the LLM to look at the actual data values across all sheets and reason:
- * 1. Which sheet is identity / address / account
- * 2. Which column maps to which schema concept
- * 3. Which column is the shared customer identifier
- * Column NAMES are treated as irrelevant hints — the LLM reads VALUES.
- */
-async function detectSchemaWithLLM(sheets) {
-  const sheetSamples = {};
-  for (const [name, rows] of Object.entries(sheets)) {
-    if (!rows.length) continue;
-    sheetSamples[name] = {
-      columns: Object.keys(rows[0]),
-      sample_rows: rows.slice(0, 3)
-    };
-  }
-
-  const mappingPrompt = `You are a data schema analyst. You are given sample data from a spreadsheet with unknown column names.
-
-Analyse the ACTUAL DATA VALUES — not just the column names — and map each sheet/column to our standard KYC schema.
-
-OUR STANDARD SCHEMA:
-- identity: customer_id, full_name, date_of_birth, national_id_number, gender
-- address: address_id, customer_id, address_line_1, address_line_2, city, postcode, country, address_source (how address was obtained: branch/app/call_centre/document_verification), recorded_by, date_recorded, date_superseded
-- account: customer_id, account_open_date, last_interaction_date, last_interaction_channel, document_verification_status
-
-SPREADSHEET DATA:
-${JSON.stringify(sheetSamples, null, 2)}
-
-Instructions:
-1. Read the actual values to understand what each column represents
-2. Map each sheet to identity/address/account (may not have all three)
-3. Map each column to its schema field — or null if no match
-4. Identify the customer identifier: the column whose values link all sheets together
-
-Respond ONLY with this JSON, no other text:
-{
-  "id_column": "<actual column name that is the customer identifier>",
-  "id_sheet": "<sheet name with identity data or null>",
-  "address_sheet": "<sheet name with address history or null>",
-  "account_sheet": "<sheet name with account data or null>",
-  "column_mappings": {
-    "<sheet_name>": { "<actual_column_name>": "<schema_field or null>" }
-  },
-  "reasoning": "<1-2 sentences on how you identified the mapping>"
-}`;
-
-  // ─────────────────────────────────────────────────────────
-  // 🔧 BACKEND URL CONFIGURATION
-  // Set VITE_API_URL in your frontend .env file to point at
-  // your backend server. See frontend/.env.example
-  // ─────────────────────────────────────────────────────────
-  const API_URL = import.meta.env.VITE_API_URL || "http://localhost:3001";
-
+async function detectSchema(sheetSamples) {
   const response = await fetch(`${API_URL}/api/detect-schema`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({ sheetSamples }),
   });
-
-  if (!response.ok) throw new Error("Schema detection failed. Is the backend running?");
-  return await response.json();
+  if (!response.ok) {
+    const err = await response.json().catch(() => ({}));
+    throw new Error(err.error || "Schema detection failed. Is the backend running?");
+  }
+  return response.json();
 }
 
+async function scoreCustomer(customerData) {
+  const response = await fetch(`${API_URL}/api/score-customer`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ customerData }),
+  });
+  if (!response.ok) {
+    const err = await response.json().catch(() => ({}));
+    throw new Error(err.error || "Scoring failed. Is the backend running?");
+  }
+  return response.json();
+}
 
 // ── Customer Assembly ────────────────────────────────────────────────────────
 
-/**
- * Assemble all data for a customer using the LLM-generated schema mapping.
- * Remaps raw column names to standard schema names so the scoring LLM
- * always receives data labelled with schema terms regardless of source column names.
- */
 function assembleCustomer(cid, schemaMap, sheets) {
   const { id_column, id_sheet, address_sheet, account_sheet, column_mappings } = schemaMap;
   const data = { customer_id: String(cid), identity: {}, addresses: [], account: {}, missing_fields: [] };
 
-  // Helper: remap a row's keys using the column_mappings for that sheet
   function remapRow(sheetName, row) {
     const mapping = column_mappings[sheetName] || {};
     const remapped = {};
     for (const [col, val] of Object.entries(row)) {
       const schemaField = mapping[col];
       if (schemaField) remapped[schemaField] = val ?? "";
-      else remapped[col] = val ?? ""; // keep unmapped cols too — let LLM use them
+      else remapped[col] = val ?? "";
     }
     return remapped;
   }
 
-  // Identity
   if (id_sheet && sheets[id_sheet]) {
     const row = sheets[id_sheet].find(r => String(r[id_column]) === String(cid));
     if (row) data.identity = remapRow(id_sheet, row);
@@ -131,7 +82,6 @@ function assembleCustomer(cid, schemaMap, sheets) {
     data.missing_fields.push("No identity table detected");
   }
 
-  // Addresses
   if (address_sheet && sheets[address_sheet]) {
     const rows = sheets[address_sheet].filter(r => String(r[id_column]) === String(cid));
     rows.forEach(r => data.addresses.push(remapRow(address_sheet, r)));
@@ -140,7 +90,6 @@ function assembleCustomer(cid, schemaMap, sheets) {
     data.missing_fields.push("No address table detected");
   }
 
-  // Account
   if (account_sheet && sheets[account_sheet]) {
     const row = sheets[account_sheet].find(r => String(r[id_column]) === String(cid));
     if (row) data.account = remapRow(account_sheet, row);
@@ -150,29 +99,6 @@ function assembleCustomer(cid, schemaMap, sheets) {
   }
 
   return data;
-}
-
-// ── LLM Call ─────────────────────────────────────────────────────────────────
-
-async function scoreCustomer(customerData) {
-  const API_URL = import.meta.env.VITE_API_URL || "http://localhost:3001";
-
-  const response = await fetch(`${API_URL}/api/score-customer`, {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ customerData }),
-  });
-
-  if (!response.ok) {
-    return {
-      confidence_percentage: 0, traffic_light: "RED",
-      recommended_address: "Server error",
-      reasoning: "Could not reach the backend server. Please check it is running.",
-      positive_factors: [], negative_factors: ["Backend connection error"], missing_data_impact: []
-    };
-  }
-
-  return await response.json();
 }
 
 // ── UI Components ────────────────────────────────────────────────────────────
@@ -190,6 +116,35 @@ function TrafficBadge({ light, pct }) {
         fontFamily: "'DM Mono', monospace", fontSize: 22,
         fontWeight: 700, color: t.bg
       }}>{pct}%</div>
+    </div>
+  );
+}
+
+function ScoreBreakdown({ breakdown }) {
+  if (!breakdown) return null;
+  const rows = [
+    { label: "Recency",      max: 40, score: breakdown.recencyScore },
+    { label: "Verification", max: 30, score: breakdown.verificationScore },
+    { label: "Consistency",  max: 20, score: breakdown.consistencyScore },
+    { label: "Source",       max: 10, score: breakdown.sourceScore },
+  ];
+  return (
+    <div style={{ marginTop: 16, background: "#F4F6F9", borderRadius: 8, padding: "12px 14px" }}>
+      <div style={{ fontSize: 11, fontWeight: 700, color: "#6B7F94", letterSpacing: 1, marginBottom: 10, fontFamily: "'DM Mono', monospace" }}>SCORE BREAKDOWN</div>
+      {rows.map(({ label, max, score }) => (
+        <div key={label} style={{ display: "flex", alignItems: "center", gap: 10, marginBottom: 6 }}>
+          <div style={{ width: 90, fontSize: 12, color: "#4A5D6E" }}>{label}</div>
+          <div style={{ flex: 1, background: "#E8EDF2", borderRadius: 100, height: 6 }}>
+            <div style={{
+              background: "#2D6CDF", height: "100%", borderRadius: 100,
+              width: `${(score / max) * 100}%`, transition: "width 0.4s ease"
+            }} />
+          </div>
+          <div style={{ width: 50, fontSize: 12, color: "#4A5D6E", fontFamily: "'DM Mono', monospace", textAlign: "right" }}>
+            {score} / {max}
+          </div>
+        </div>
+      ))}
     </div>
   );
 }
@@ -237,20 +192,19 @@ function CustomerCard({ result, index }) {
       {open && (
         <div style={{ padding: "0 20px 20px", borderTop: `1px solid ${t.bg}33` }}>
 
-          {/* Recommended address */}
           <div style={{ marginTop: 16, padding: "12px 16px", background: t.light, borderRadius: 8, borderLeft: `3px solid ${t.bg}` }}>
             <div style={{ fontSize: 11, fontWeight: 700, color: t.bg, letterSpacing: 1, marginBottom: 4, fontFamily: "'DM Mono', monospace" }}>RECOMMENDED ADDRESS</div>
             <div style={{ fontSize: 14, color: "#0D1B2A", fontWeight: 500 }}>{result.recommended_address}</div>
           </div>
 
-          {/* Reasoning */}
           <div style={{ marginTop: 16 }}>
             <div style={{ fontSize: 11, fontWeight: 700, color: "#6B7F94", letterSpacing: 1, marginBottom: 6, fontFamily: "'DM Mono', monospace" }}>ANALYSIS</div>
             <div style={{ fontSize: 14, color: "#2D3F50", lineHeight: 1.6 }}>{result.reasoning}</div>
           </div>
 
+          <ScoreBreakdown breakdown={result.score_breakdown} />
+
           <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 16, marginTop: 16 }}>
-            {/* Positive */}
             <div style={{ background: "#F0FBF4", borderRadius: 8, padding: "12px 14px" }}>
               <div style={{ fontSize: 11, fontWeight: 700, color: "#00875A", letterSpacing: 1, marginBottom: 8, fontFamily: "'DM Mono', monospace" }}>POSITIVE FACTORS</div>
               {result.positive_factors?.length ? result.positive_factors.map((f, i) => (
@@ -260,7 +214,6 @@ function CustomerCard({ result, index }) {
               )) : <div style={{ fontSize: 13, color: "#6B7F94" }}>None identified</div>}
             </div>
 
-            {/* Negative */}
             <div style={{ background: "#FFF5F5", borderRadius: 8, padding: "12px 14px" }}>
               <div style={{ fontSize: 11, fontWeight: 700, color: "#DE350B", letterSpacing: 1, marginBottom: 8, fontFamily: "'DM Mono', monospace" }}>NEGATIVE FACTORS</div>
               {result.negative_factors?.length ? result.negative_factors.map((f, i) => (
@@ -271,7 +224,6 @@ function CustomerCard({ result, index }) {
             </div>
           </div>
 
-          {/* Missing data */}
           {result.missing_data_impact?.length > 0 && (
             <div style={{ marginTop: 16, background: "#FFFAE6", borderRadius: 8, padding: "12px 14px", borderLeft: "3px solid #FF8B00" }}>
               <div style={{ fontSize: 11, fontWeight: 700, color: "#FF8B00", letterSpacing: 1, marginBottom: 8, fontFamily: "'DM Mono', monospace" }}>DATA GAPS — WHAT WOULD IMPROVE THIS SCORE</div>
@@ -298,9 +250,9 @@ function SummaryBar({ results }) {
     <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr 1fr 1fr", gap: 12, marginBottom: 24 }}>
       {[
         { label: "AVG CONFIDENCE", value: `${avg}%`, color: "#0D1B2A" },
-        { label: "COMPLIANT", value: green, color: "#00875A" },
-        { label: "NEEDS REVIEW", value: amber, color: "#FF8B00" },
-        { label: "ACTION REQUIRED", value: red, color: "#DE350B" },
+        { label: "COMPLIANT",      value: green,     color: "#00875A" },
+        { label: "NEEDS REVIEW",   value: amber,     color: "#FF8B00" },
+        { label: "ACTION REQUIRED",value: red,       color: "#DE350B" },
       ].map(({ label, value, color }) => (
         <div key={label} style={{ background: "#fff", borderRadius: 10, padding: "16px 20px", border: "1px solid #E8EDF2", boxShadow: "0 1px 4px #00000008" }}>
           <div style={{ fontSize: 10, fontWeight: 700, color: "#6B7F94", letterSpacing: 1, marginBottom: 6, fontFamily: "'DM Mono', monospace" }}>{label}</div>
@@ -314,10 +266,10 @@ function SummaryBar({ results }) {
 // ── Main App ─────────────────────────────────────────────────────────────────
 
 export default function App() {
-  const [stage, setStage] = useState("upload"); // upload | processing | results
-  const [results, setResults] = useState([]);
+  const [stage, setStage]       = useState("upload");
+  const [results, setResults]   = useState([]);
   const [progress, setProgress] = useState({ current: 0, total: 0, name: "" });
-  const [error, setError] = useState(null);
+  const [error, setError]       = useState(null);
   const [dragging, setDragging] = useState(false);
 
   const processFile = useCallback(async (file) => {
@@ -328,24 +280,24 @@ export default function App() {
       const buffer = await file.arrayBuffer();
       const wb = XLSX.read(buffer, { type: "array" });
 
-      const sheets = {};
+      const normSheets = {};
       wb.SheetNames.forEach(name => {
-        sheets[name] = XLSX.utils.sheet_to_json(wb.Sheets[name], { defval: "" });
+        normSheets[name] = normaliseRows(XLSX.utils.sheet_to_json(wb.Sheets[name], { defval: "" }));
       });
 
-      // Normalise all sheet data
-      const normSheets = {};
-      for (const [k, rows] of Object.entries(sheets)) {
-        normSheets[k] = normaliseRows(rows);
+      setProgress({ current: 0, total: 1, name: "Analysing spreadsheet structure..." });
+
+      // Build sheet samples for the backend schema detection call
+      const sheetSamples = {};
+      for (const [name, rows] of Object.entries(normSheets)) {
+        if (!rows.length) continue;
+        sheetSamples[name] = { columns: Object.keys(rows[0]), sample_rows: rows.slice(0, 3) };
       }
 
-      // Step 1: Ask the LLM to read the actual data and map the schema
-      setProgress({ current: 0, total: 1, name: "Analysing spreadsheet structure..." });
-      const schemaMap = await detectSchemaWithLLM(normSheets);
+      const schemaMap = await detectSchema(sheetSamples);
 
-      // Step 2: Gather all unique customer IDs using the LLM-detected ID column
       const { id_column } = schemaMap;
-      if (!id_column) throw new Error("LLM could not identify a customer identifier column.");
+      if (!id_column) throw new Error("Could not identify a customer identifier column.");
 
       const cidSet = new Set();
       for (const rows of Object.values(normSheets)) {
@@ -359,12 +311,9 @@ export default function App() {
       const scored = [];
       for (let i = 0; i < cids.length; i++) {
         const cid = cids[i];
-        // Step 3: Assemble customer data with columns remapped to schema names
         const customerData = assembleCustomer(cid, schemaMap, normSheets);
-        // Find name from identity — will now be labelled "full_name" after remapping
         const fullName = customerData.identity?.full_name || cid;
         setProgress({ current: i + 1, total: cids.length, name: fullName });
-
         const score = await scoreCustomer(customerData);
         scored.push({ ...score, customer_id: cid, full_name: fullName });
       }
@@ -384,14 +333,9 @@ export default function App() {
     if (file) processFile(file);
   }, [processFile]);
 
-  // ── Render ──
-
   return (
-    <div style={{
-      minHeight: "100vh", background: "#F4F6F9",
-      fontFamily: "'DM Sans', 'Segoe UI', sans-serif",
-    }}>
-      {/* Header */}
+    <div style={{ minHeight: "100vh", background: "#F4F6F9", fontFamily: "'DM Sans', 'Segoe UI', sans-serif" }}>
+
       <div style={{ background: "#0D1B2A", padding: "20px 32px", display: "flex", alignItems: "center", justifyContent: "space-between" }}>
         <div style={{ display: "flex", alignItems: "center", gap: 12 }}>
           <div style={{ width: 32, height: 32, background: "#2D6CDF", borderRadius: 8, display: "flex", alignItems: "center", justifyContent: "center" }}>
@@ -414,7 +358,6 @@ export default function App() {
 
       <div style={{ maxWidth: 900, margin: "0 auto", padding: "32px 24px" }}>
 
-        {/* Upload Stage */}
         {stage === "upload" && (
           <div>
             <div style={{ marginBottom: 32 }}>
@@ -446,7 +389,6 @@ export default function App() {
               <input id="file-input" type="file" accept=".xlsx,.xls" style={{ display: "none" }} onChange={onDrop} />
             </div>
 
-            {/* Schema reminder */}
             <div style={{ marginTop: 24, background: "#fff", borderRadius: 12, padding: "20px 24px", border: "1px solid #E8EDF2" }}>
               <div style={{ fontSize: 12, fontWeight: 700, color: "#6B7F94", letterSpacing: 1, marginBottom: 12, fontFamily: "'DM Mono', monospace" }}>EXPECTED SCHEMA COLUMNS</div>
               <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr 1fr", gap: 16 }}>
@@ -464,7 +406,6 @@ export default function App() {
           </div>
         )}
 
-        {/* Processing Stage */}
         {stage === "processing" && (
           <div style={{ textAlign: "center", padding: "80px 40px" }}>
             <div style={{ fontSize: 48, marginBottom: 24 }}>⚙️</div>
@@ -473,7 +414,7 @@ export default function App() {
             </h2>
             <div style={{ color: "#6B7F94", fontSize: 15, marginBottom: 32 }}>
               {progress.current === 0
-                ? "The LLM is reading your data to understand the column structure..."
+                ? "Reading your data to understand the column structure..."
                 : <>Scoring {progress.name && <strong style={{ color: "#0D1B2A" }}>{progress.name}</strong>} — {progress.current} of {progress.total}</>
               }
             </div>
@@ -487,16 +428,13 @@ export default function App() {
           </div>
         )}
 
-        {/* Results Stage */}
         {stage === "results" && results.length > 0 && (
           <div>
             <div style={{ marginBottom: 24 }}>
               <h2 style={{ fontSize: 24, fontWeight: 800, color: "#0D1B2A", margin: "0 0 4px" }}>Results — {results.length} customers scored</h2>
               <p style={{ color: "#6B7F94", fontSize: 14, margin: 0 }}>Click any row to expand the full analysis and data gap recommendations.</p>
             </div>
-
             <SummaryBar results={results} />
-
             {results
               .sort((a, b) => a.confidence_percentage - b.confidence_percentage)
               .map((r, i) => <CustomerCard key={r.customer_id} result={r} index={i} />)
