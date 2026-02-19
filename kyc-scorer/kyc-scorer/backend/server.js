@@ -51,7 +51,7 @@ function safeParseJSON(text, context) {
   const cleaned = text.replace(/```json|```/g, "").trim();
   try {
     return { data: JSON.parse(cleaned), error: null };
-  } catch {
+  } catch (err) {
     return {
       data: null,
       error: {
