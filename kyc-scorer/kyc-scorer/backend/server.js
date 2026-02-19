@@ -1,111 +1,134 @@
 /**
  * KYC Address Confidence Scorer — Backend Server
  *
- * Handles all calls to the Anthropic API so the API key
- * is never exposed to the browser.
- *
  * Endpoints:
- *   POST /api/detect-schema  — LLM reads spreadsheet data and maps columns
- *   POST /api/score-customer — LLM scores a single customer's address data
+ *   POST /api/detect-schema  — LLM maps spreadsheet columns to KYC schema
+ *   POST /api/score-customer — LLM extracts facts, code calculates score
  *   POST /api/score-customers — Scores multiple customers with controlled concurrency
  */
 
-const express = require("express");
-const cors    = require("cors");
+const express  = require("express");
+const cors     = require("cors");
 const Anthropic = require("@anthropic-ai/sdk");
-
-// ─────────────────────────────────────────────────────────────────────────────
-// 🔑 API KEY CONFIGURATION
-//
-// NEVER hardcode your API key here.
-// Set it as an environment variable before running the server.
-//
-// Locally:
-//   Create a .env file in this directory (see .env.example) and run:
-//   node server.js
-//   OR set it directly in your terminal:
-//   export ANTHROPIC_API_KEY=sk-ant-...
-//
-// In production (Railway / Render / Heroku / AWS etc):
-//   Add ANTHROPIC_API_KEY as a secret environment variable
-//   in your hosting provider's dashboard. Never put it in code.
-// ─────────────────────────────────────────────────────────────────────────────
 
 require("dotenv").config();
 
 if (!process.env.ANTHROPIC_API_KEY) {
   console.error("❌ ANTHROPIC_API_KEY environment variable is not set.");
-  console.error("   Create a .env file from .env.example and add your key.");
   process.exit(1);
 }
 
 const client = new Anthropic({ apiKey: process.env.ANTHROPIC_API_KEY });
 const app    = express();
 
-app.use(cors({
-  // ⚠️  PRODUCTION: Replace "*" with your actual frontend domain
-  // e.g. origin: "https://your-app.vercel.app"
-  origin: process.env.FRONTEND_URL || "*",
-}));
-
+app.use(cors({ origin: process.env.FRONTEND_URL || "*" }));
 app.use(express.json({ limit: "10mb" }));
 
-const MODEL   = "claude-sonnet-4-20250514";
-const TODAY   = new Date().toISOString().split("T")[0];
+const MODEL = "claude-sonnet-4-20250514";
+const TODAY = new Date().toISOString().split("T")[0];
 
 // ── Concurrency limiter ───────────────────────────────────────────────────────
-// Controls how many simultaneous Anthropic API calls are made when scoring
-// multiple customers. Keeps us well within rate limits.
-// Adjust CONCURRENCY_LIMIT up or down based on your API tier.
 
 const CONCURRENCY_LIMIT = parseInt(process.env.CONCURRENCY_LIMIT || "5", 10);
 
 function createLimiter(concurrency) {
   let active = 0;
   const queue = [];
-
   function next() {
     if (active >= concurrency || queue.length === 0) return;
     active++;
     const { fn, resolve, reject } = queue.shift();
-    fn()
-      .then(resolve)
-      .catch(reject)
-      .finally(() => {
-        active--;
-        next();
-      });
+    fn().then(resolve).catch(reject).finally(() => { active--; next(); });
   }
-
-  return function limit(fn) {
-    return new Promise((resolve, reject) => {
-      queue.push({ fn, resolve, reject });
-      next();
-    });
-  };
+  return fn => new Promise((resolve, reject) => { queue.push({ fn, resolve, reject }); next(); });
 }
 
 const limit = createLimiter(CONCURRENCY_LIMIT);
 
 // ── Safe JSON parser ──────────────────────────────────────────────────────────
-// Wraps JSON.parse with a descriptive error so the caller knows exactly
-// what went wrong and can surface it meaningfully in the UI.
 
 function safeParseJSON(text, context) {
   const cleaned = text.replace(/```json|```/g, "").trim();
   try {
     return { data: JSON.parse(cleaned), error: null };
-  } catch (err) {
+  } catch {
     return {
       data: null,
       error: {
         code: "PARSE_ERROR",
-        context,
-        message: `The AI response for ${context} was not valid JSON. This can happen occasionally — please retry.`,
-        raw: cleaned.slice(0, 300), // truncated for logging, not sent to client
+        message: `The AI response for ${context} was not valid JSON. Please retry.`,
+        raw: cleaned.slice(0, 300),
       },
     };
   }
+}
+
+// ── Deterministic score calculator ───────────────────────────────────────────
+//
+// Weights:
+//   Recency      40 pts  — age of most recent verified address record
+//   Verification 30 pts  — strongest verification method found
+//   Consistency  20 pts  — address agreement across records
+//   Source       10 pts  — best source quality present
+//
+// Traffic lights:  GREEN 75+ | AMBER 40–74 | RED <40
+
+const RECENCY_SCORES = [
+  { maxMonths:  12, score: 40 },
+  { maxMonths:  24, score: 30 },
+  { maxMonths:  36, score: 20 },
+  { maxMonths:  60, score: 10 },
+  { maxMonths: Infinity, score: 0 },
+];
+
+const VERIFICATION_SCORES = {
+  document_verification: 30,
+  passport:              28,
+  usps_cass:             25,
+  driving_licence:       22,
+  utility_bill:          20,
+  bank_statement:        18,
+  branch:                15,
+  app:                   10,
+  call_centre:            8,
+  self_declared:          5,
+  none:                   0,
+};
+
+const SOURCE_SCORES = {
+  document_verification: 10,
+  branch:                 8,
+  app:                    5,
+  call_centre:            3,
+  none:                   0,
+};
+
+function calculateScore(facts) {
+  let recencyScore = 0;
+  if (facts.most_recent_record_date) {
+    const ageMonths = (Date.now() - new Date(facts.most_recent_record_date).getTime()) / (1000 * 60 * 60 * 24 * 30.44);
+    recencyScore = RECENCY_SCORES.find(r => ageMonths <= r.maxMonths).score;
+  }
+
+  const verificationKey  = (facts.strongest_verification_method || "none").toLowerCase().replace(/\s+/g, "_");
+  const verificationScore = VERIFICATION_SCORES[verificationKey] ?? 0;
+
+  const consistencyScore =
+    facts.address_conflict === false   ? 20 :
+    facts.address_conflict === "minor" ? 12 :
+    0;
+
+  const sourceKey   = (facts.best_source || "none").toLowerCase().replace(/\s+/g, "_");
+  const sourceScore = SOURCE_SCORES[sourceKey] ?? 0;
+
+  const confidence_percentage = recencyScore + verificationScore + consistencyScore + sourceScore;
+
+  const traffic_light =
+    confidence_percentage >= 75 ? "GREEN" :
+    confidence_percentage >= 40 ? "AMBER" :
+    "RED";
+
+  return { confidence_percentage, traffic_light, score_breakdown: { recencyScore, verificationScore, consistencyScore, sourceScore } };
 }
 
 // ── Health check ─────────────────────────────────────────────────────────────
@@ -116,10 +139,7 @@ app.get("/health", (req, res) => res.json({ status: "ok" }));
 
 app.post("/api/detect-schema", async (req, res) => {
   const { sheetSamples } = req.body;
-
-  if (!sheetSamples) {
-    return res.status(400).json({ error: "sheetSamples is required" });
-  }
+  if (!sheetSamples) return res.status(400).json({ error: "sheetSamples is required" });
 
   const prompt = `You are a data schema analyst. You are given sample data from a spreadsheet with unknown column names.
 
@@ -163,10 +183,7 @@ Respond ONLY with this JSON, no other text:
 
     if (error) {
       console.error("Schema parse error:", error.raw);
-      return res.status(502).json({
-        error: error.message,
-        code: error.code,
-      });
+      return res.status(502).json({ error: error.message, code: error.code });
     }
 
     res.json(data);
@@ -176,36 +193,28 @@ Respond ONLY with this JSON, no other text:
   }
 });
 
-// ── Scoring system prompt ─────────────────────────────────────────────────────
+// ── Fact extraction system prompt ─────────────────────────────────────────────
+//
+// The LLM extracts structured facts only. calculateScore() handles all arithmetic.
 
-const SCORING_SYSTEM = `You are a KYC compliance analysis engine for financial institutions.
-
-Analyse customer address data and return a structured confidence score.
-
-SCORING FRAMEWORK (apply in this priority order):
-1. RECENCY — date_recorded within 12 months = high confidence. Degrades the older the record.
-2. VERIFICATION — weighted by how recently it was done. Recent document verification = large boost.
-3. FREQUENCY — same address appearing multiple times adds confidence. More recent repetitions count more.
-4. SOURCE QUALITY — ranked: document_verification > branch > app > call_centre
-
-TRAFFIC LIGHT THRESHOLDS:
-- GREEN: 75% and above (compliant)
-- AMBER: 40–74% (needs review)
-- RED: below 40% (action required)
-
-GRACEFUL DEGRADATION: If a factor cannot be assessed due to missing data, do NOT penalise the score. Flag it in missing_data_impact instead.
+const EXTRACTION_SYSTEM = `You are a KYC data analyst. Read the customer address records and extract key facts only.
+Do not score or judge. Just report what the data shows.
 
 TODAY: ${TODAY}
 
-Respond ONLY with a valid JSON object, no other text:
+Respond ONLY with this JSON, no other text:
 {
-  "confidence_percentage": <integer 0-100>,
-  "traffic_light": <"GREEN"|"AMBER"|"RED">,
-  "recommended_address": <full address string or "Insufficient data">,
-  "reasoning": <2-4 sentence plain English explanation>,
-  "positive_factors": [<strings>],
-  "negative_factors": [<strings>],
-  "missing_data_impact": [<specific actionable recommendations>]
+  "customer_id": "<id>",
+  "full_name": "<name>",
+  "most_recent_record_date": "<YYYY-MM-DD of the most recently dated address record, or null>",
+  "strongest_verification_method": "<strongest method present: document_verification | passport | driving_licence | usps_cass | utility_bill | bank_statement | branch | app | call_centre | self_declared | none>",
+  "address_conflict": <true if meaningfully different addresses exist (different street or city) | "minor" if only formatting or abbreviation differences | false if all records agree>,
+  "best_source": "<best source present: document_verification | branch | app | call_centre | none>",
+  "recommended_address": "<most credible full address based on recency and verification, or 'Insufficient data'>",
+  "reasoning": "<2-4 sentence plain English explanation of what the data shows>",
+  "positive_factors": ["<string>"],
+  "negative_factors": ["<string>"],
+  "missing_data_impact": ["<specific actionable recommendation>"]
 }`;
 
 // ── Shared scoring function ───────────────────────────────────────────────────
@@ -214,34 +223,43 @@ async function scoreCustomer(customerData) {
   const message = await client.messages.create({
     model: MODEL,
     max_tokens: 1000,
-    system: SCORING_SYSTEM,
+    system: EXTRACTION_SYSTEM,
     messages: [{
       role: "user",
-      content: `Analyse this customer and return the JSON confidence score:\n\n${JSON.stringify(customerData, null, 2)}`,
+      content: `Extract facts from this customer's address records:\n\n${JSON.stringify(customerData, null, 2)}`,
     }],
   });
 
   const text = message.content.map(b => b.text || "").join("");
-  const { data, error } = safeParseJSON(text, `customer ${customerData?.customer_id || "unknown"}`);
+  const { data: facts, error } = safeParseJSON(text, `customer ${customerData?.customer_id || "unknown"}`);
 
   if (error) throw error;
-  return data;
+
+  const { confidence_percentage, traffic_light, score_breakdown } = calculateScore(facts);
+
+  return {
+    customer_id:         facts.customer_id,
+    full_name:           facts.full_name,
+    confidence_percentage,
+    traffic_light,
+    score_breakdown,
+    recommended_address: facts.recommended_address,
+    reasoning:           facts.reasoning,
+    positive_factors:    facts.positive_factors,
+    negative_factors:    facts.negative_factors,
+    missing_data_impact: facts.missing_data_impact,
+  };
 }
 
 // ── Single customer scoring ───────────────────────────────────────────────────
 
 app.post("/api/score-customer", async (req, res) => {
   const { customerData } = req.body;
-
-  if (!customerData) {
-    return res.status(400).json({ error: "customerData is required" });
-  }
+  if (!customerData) return res.status(400).json({ error: "customerData is required" });
 
   try {
-    const score = await scoreCustomer(customerData);
-    res.json(score);
+    res.json(await scoreCustomer(customerData));
   } catch (err) {
-    // Distinguish parse errors from API errors for better UI messaging
     if (err.code === "PARSE_ERROR") {
       console.error("Scoring parse error:", err.raw);
       return res.status(502).json({ error: err.message, code: err.code });
@@ -251,20 +269,10 @@ app.post("/api/score-customer", async (req, res) => {
   }
 });
 
-// ── Bulk customer scoring (concurrency-limited) ───────────────────────────────
-//
-// Accepts an array of customerData objects and scores them in parallel,
-// capped at CONCURRENCY_LIMIT simultaneous API calls.
-//
-// Each result includes the original customer_id so the frontend can
-// match scores back to customers regardless of response order.
-//
-// Failed individual scores are returned with { error } rather than
-// aborting the entire batch, so one bad record doesn't block the rest.
+// ── Bulk customer scoring ─────────────────────────────────────────────────────
 
 app.post("/api/score-customers", async (req, res) => {
   const { customers } = req.body;
-
   if (!Array.isArray(customers) || customers.length === 0) {
     return res.status(400).json({ error: "customers must be a non-empty array" });
   }
@@ -274,10 +282,8 @@ app.post("/api/score-customers", async (req, res) => {
       customers.map(customerData =>
         limit(async () => {
           try {
-            const score = await scoreCustomer(customerData);
-            return { customer_id: customerData?.customer_id, ...score };
+            return await scoreCustomer(customerData);
           } catch (err) {
-            // Per-customer failure — log and return gracefully so batch continues
             console.error(`Failed to score customer ${customerData?.customer_id}:`, err.message || err);
             return {
               customer_id: customerData?.customer_id,
@@ -288,7 +294,6 @@ app.post("/api/score-customers", async (req, res) => {
         })
       )
     );
-
     res.json({ results });
   } catch (err) {
     console.error("Bulk scoring error:", err.message);
@@ -301,6 +306,5 @@ app.post("/api/score-customers", async (req, res) => {
 const PORT = process.env.PORT || 3001;
 app.listen(PORT, () => {
   console.log(`✅ KYC Scorer backend running on port ${PORT}`);
-  console.log(`   API key loaded: ${process.env.ANTHROPIC_API_KEY ? "yes" : "NO — set ANTHROPIC_API_KEY"}`);
   console.log(`   Concurrency limit: ${CONCURRENCY_LIMIT}`);
 });
